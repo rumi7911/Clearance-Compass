@@ -260,6 +260,17 @@ researched every time). To enable it:
 3. Fill in the `CLICKHOUSE_*` variables in `.env` (local) or wire them up
    as shown in the Deploy section above (Cloud Run).
 
+**Known limitation: entity-naming variance.** The cache key includes the
+Extractor's literal entity name, and that name isn't always identical
+across separate runs of the same scene (e.g. "Liquid Death" vs. "Liquid
+Death mountain water" for the same on-screen can, observed live in
+production testing) -- LLM extraction has some inherent phrasing
+variance. This costs a cache hit, not correctness: a miss just means the
+entity gets freshly researched again, never that a wrong or stale verdict
+is served. Not fixed -- a real fix (normalized aliasing, fuzzy matching)
+risks introducing new false-collision bugs and wasn't worth rushing this
+close to the submission deadline.
+
 ## Known limitation: fresh-project quota
 
 Brand-new GCP projects start with a very low default per-minute request

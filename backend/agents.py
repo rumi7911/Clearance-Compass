@@ -20,6 +20,7 @@ Critic report structured results by calling a tool instead.
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -146,6 +147,13 @@ def submit_verdict(
 
 
 def build_critic_agent() -> LlmAgent:
+    # A model has no built-in clock -- without being told, it reasons about
+    # "recent" from a fuzzy, possibly stale sense of "now" (its training
+    # cutoff), not the actual date this request is running. That's exactly
+    # what let evidence over two years old get scored as satisfying an
+    # "within ~18 months" bar in production testing. Stating today's real
+    # date here grounds the recency judgment in reality.
+    today = datetime.now(timezone.utc).date().isoformat()
     return LlmAgent(
         model=MODEL,
         name="critic",
@@ -154,13 +162,17 @@ def build_critic_agent() -> LlmAgent:
             "You are a skeptical clearance reviewer, separate from the "
             "researcher. Read the research notes below and judge whether they "
             "are strong enough to make a clearance risk call for this entity.\n\n"
+            f"Today's real date is {today}. Use this, not any date you might "
+            "otherwise assume, whenever you judge whether a source is "
+            "recent.\n\n"
             "Entity: {entity_name} ({entity_category})\n"
             "Research notes:\n{research_notes}\n\n"
             f"Before calling confidence {CONFIDENCE_THRESHOLD} or higher, the "
             "notes must clearly establish BOTH: (1) at least two independent "
             "sources that agree, AND (2) at least one of those sources has a "
             "confirmed publication or last-updated date within roughly the "
-            "last 18 months. A source with no stated date does not count "
+            f"18 months before {today} -- count the actual gap, don't "
+            "estimate. A source with no stated date does not count "
             "toward recency -- treat undated evidence as unconfirmed, not as "
             "presumed current, since rights holders and licensing status can "
             "change. If either condition isn't clearly met, set confidence "
