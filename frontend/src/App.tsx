@@ -3,6 +3,7 @@ import type { ClearanceGraphData } from './types'
 import { ClearanceGraph } from './ClearanceGraph'
 import { ScriptInput } from './ScriptInput'
 import { LoadingState } from './LoadingState'
+import { Landing } from './Landing'
 
 type Status = 'idle' | 'loading' | 'error' | 'done'
 
@@ -69,20 +70,9 @@ export function App() {
 
   return (
     <div className="page">
-      <header className="masthead">
-        <div className="masthead-row">
-          <span className="eyebrow">Clearance Compass</span>
-          <span className="eyebrow">Parallel Search &amp; Extract MCP</span>
-        </div>
-        <h1>The Clearance Graph</h1>
-        <p className="tagline">
-          Every real-world mention in a script, researched live and scored
-          for risk — not a chat transcript, a map of what still needs a
-          human's sign-off.
-        </p>
-      </header>
+      <Landing />
 
-      <main className="page-body">
+      <main className="page-body" id="case-file">
         {status === 'loading' && <LoadingState />}
         {(status === 'idle' || status === 'error') && (
           <ScriptInput

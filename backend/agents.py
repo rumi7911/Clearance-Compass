@@ -106,6 +106,7 @@ def submit_verdict(
     risk_level: Literal["green", "yellow", "red"],
     reasoning: str,
     retry_query: str,
+    evidence_as_of: str,
     tool_context: ToolContext,
 ) -> dict:
     """Record this round's clearance assessment and decide whether to stop or retry.
@@ -117,6 +118,11 @@ def submit_verdict(
         reasoning: one or two sentences explaining the call.
         retry_query: if confidence is below 0.7, a genuinely different search
             angle to try next; empty string if not retrying.
+        evidence_as_of: the most recent confirmed publication/last-updated
+            date among the sources used, as "YYYY-MM-DD" or "YYYY-MM". Empty
+            string if no source had a confirmed date. This is what agent
+            memory uses to decide how long the verdict stays reusable -- it
+            must reflect the evidence's real-world age, not today's date.
     """
     attempts = list(tool_context.state.get("attempts", []))
     attempts.append(
@@ -125,6 +131,7 @@ def submit_verdict(
             "risk_level": risk_level,
             "reasoning": reasoning,
             "retry_query": retry_query,
+            "evidence_as_of": evidence_as_of,
             "research_notes": tool_context.state.get("research_notes", ""),
         }
     )
@@ -161,7 +168,12 @@ def build_critic_agent() -> LlmAgent:
             "search angle (not a rephrasing) in retry_query -- for example, "
             "add a recent year, ask about a specific recent event, or search "
             "a different source type (news vs. official registry vs. trade "
-            "press). Call submit_verdict exactly once with your assessment."
+            "press). Call submit_verdict exactly once with your assessment, "
+            "including evidence_as_of: the most recent confirmed source "
+            "date among the sources you're relying on (empty string if "
+            "none had a confirmed date) -- this is used later to decide "
+            "how long this verdict can be reused without re-checking, so "
+            "report the evidence's real date, not today's date."
         ),
         tools=[submit_verdict],
     )

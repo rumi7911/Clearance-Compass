@@ -34,15 +34,21 @@ not a scripted animation. Dark mode is supported too:
 
 ## Hackathon submission details
 
-- **Track:** Parallel + ClickHouse partner integrations, alongside Gemini
-  and the Agent Development Kit.
+- **Track:** Parallel (Search & Extract MCP, used live in the research
+  loop below). ClickHouse Cloud is also integrated as a genuine
+  agent-memory feature (see below), but that integration goes through the
+  `clickhouse-connect` Python client rather than the official
+  `mcp-clickhouse` server the ClickHouse track requires, so this
+  submission enters the Parallel track only.
 - **Live URL:** https://clearance-compass-693559838497.us-central1.run.app
 - **License:** MIT (see [`LICENSE`](LICENSE)).
 
 ## Why this counts as an agent, not a chatbot
 
-Every non-precleared entity runs through an explicit **plan → act →
-evaluate → iterate** loop, and the loop is what the UI is built to show:
+Every entity that isn't already resolved by the internal rights repository
+or a fresh agent-memory record (see "Agent memory" below) runs through an
+explicit **plan → act → evaluate → iterate** loop, and the loop is what
+the UI is built to show:
 
 1. **Plan** — an extractor agent reads a scene and lists the real-world
    entities worth clearing.
@@ -75,12 +81,26 @@ built frontend from the same process.
   sluglines (`INT.`/`EXT.`) split it into scenes automatically, no
   sluglines means the whole input runs as one scene. Omit the body (or
   send `{"script": null}`) to fall back to the synthetic demo script in
-  `backend/data/scenes.py`. Custom input is capped at 6,000 characters and
-  6 parsed scenes (extras are silently dropped with a `warning` field in
-  the response) to bound worst-case runtime/cost on the public endpoint —
-  see `backend/data/parse_script.py`. `GET /api/demo-script` serves that
-  same demo script back as plain text, which is what the frontend
-  pre-fills its textarea with.
+  `backend/data/scenes.py`. Custom input is capped at 6,000 characters, 6
+  parsed scenes, and 8 extracted entities per scene (extras are silently
+  dropped with a `warning` field in the response) to bound worst-case
+  runtime/cost on the public endpoint — see `backend/data/parse_script.py`
+  and `MAX_ENTITIES_PER_SCENE` in `backend/pipeline.py`. `GET
+  /api/demo-script` serves that same demo script back as plain text, which
+  is what the frontend pre-fills its textarea with. Each entity in the
+  response carries `resolved: bool` — `false` means the research loop ran
+  out of retries without reaching confidence and the risk shown is a
+  best-effort guess needing manual review, not a settled clearance; the
+  frontend surfaces this explicitly rather than showing it identically to
+  a confident verdict.
+- **Public-endpoint cost guards**: a per-IP cooldown
+  (`ANALYZE_PER_IP_COOLDOWN_S`, default 60s) and a daily analysis cap
+  (`ANALYZE_DAILY_CAP`, default 50) on `/api/analyze`, plus a request-body
+  size limit enforced before JSON parsing. These are process-local
+  in-memory counters, which is only a real guarantee because Cloud Run is
+  pinned to a single instance for this service (see "fresh-project quota"
+  below) — they would need a shared store (e.g. Redis) to stay correct
+  across multiple instances.
 - **Frontend**: Vite + React + TypeScript (`frontend/`), built to static
   files and served by the same FastAPI app. The idle screen is an editable
   script-intake textarea (pre-filled with the demo script), not just a
@@ -143,15 +163,31 @@ backend first.
 gcloud auth login
 gcloud config set project YOUR_PROJECT_ID
 
+# Dedicated least-privilege runtime identity -- not the default Compute
+# Engine service account, which normally carries broad roles/editor-level
+# access. This one gets only what the app actually needs at runtime.
+gcloud iam service-accounts create clearance-compass-runtime \
+  --display-name="Clearance Compass Cloud Run runtime"
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
+  --member="serviceAccount:clearance-compass-runtime@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/aiplatform.user"
+
 gcloud run deploy clearance-compass \
   --source . \
   --region us-central1 \
   --allow-unauthenticated \
   --timeout=1800 \
+  --max-instances=1 \
+  --service-account="clearance-compass-runtime@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
   --set-env-vars GOOGLE_CLOUD_PROJECT=YOUR_PROJECT_ID,GOOGLE_CLOUD_LOCATION=us-central1,GOOGLE_GENAI_USE_VERTEXAI=True
 
-# Store the Parallel key as a secret rather than a plaintext env var:
+# Store the Parallel key as a secret rather than a plaintext env var, and
+# grant the runtime SA access to *only this secret* (not project-wide
+# Secret Manager access):
 echo -n "YOUR_PARALLEL_API_KEY" | gcloud secrets create parallel-api-key --data-file=-
+gcloud secrets add-iam-policy-binding parallel-api-key \
+  --member="serviceAccount:clearance-compass-runtime@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
 gcloud run services update clearance-compass \
   --update-secrets=PARALLEL_API_KEY=parallel-api-key:latest
 
@@ -159,6 +195,9 @@ gcloud run services update clearance-compass \
 # "Agent memory" below) -- skip this if you haven't set up ClickHouse yet,
 # the app runs fine without it.
 echo -n "YOUR_CLICKHOUSE_PASSWORD" | gcloud secrets create clickhouse-password --data-file=-
+gcloud secrets add-iam-policy-binding clickhouse-password \
+  --member="serviceAccount:clearance-compass-runtime@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
 gcloud run services update clearance-compass \
   --update-secrets=CLICKHOUSE_PASSWORD=clickhouse-password:latest \
   --update-env-vars=CLICKHOUSE_HOST=YOUR_HOST,CLICKHOUSE_PORT=8443,CLICKHOUSE_USER=default,CLICKHOUSE_DATABASE=default
@@ -166,6 +205,11 @@ gcloud run services update clearance-compass \
 
 The deployed service URL is what should go in the Devpost submission form
 and get opened live in the demo video.
+
+`--max-instances=1` isn't just a cost cap -- the in-process single-flight
+lock in `main.py` and the in-memory rate-limit/daily-cap counters (see
+above) are only real guarantees while the service can't scale past one
+instance. Raise it only alongside moving those to shared state.
 
 ## Agent memory (ClickHouse)
 
@@ -196,11 +240,23 @@ researched every time). To enable it:
        attempts_json     String,
        search_trail_json String,
        resolved_at       DateTime64(3, 'UTC'),
-       scene_excerpt     String DEFAULT ''
+       scene_excerpt     String DEFAULT '',
+       evidence_as_of    String DEFAULT ''
    )
    ENGINE = ReplacingMergeTree(resolved_at)
    ORDER BY (entity_key, resolved_at);
    ```
+   `entity_key` is `{normalized name}::{category}`, not just the name, so
+   two different real-world things that share a name (e.g. a person vs. a
+   film both called "Elvis") never collide on the same cached verdict.
+   `evidence_as_of` is the Critic's self-reported date for its most recent
+   confirmed source -- freshness is measured from that date, not from
+   `resolved_at`, so a cached verdict can't compound past the same
+   ~18-month recency bar the Critic itself enforces live. Only entities the
+   Critic actually resolved with confidence at or above threshold are ever
+   written here; a verdict reached only by exhausting the retry budget is
+   reported as unresolved and is never cached (see `resolved` in the API
+   response below).
 3. Fill in the `CLICKHOUSE_*` variables in `.env` (local) or wire them up
    as shown in the Deploy section above (Cloud Run).
 

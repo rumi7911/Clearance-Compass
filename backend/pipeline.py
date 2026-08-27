@@ -24,10 +24,15 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
-from .agents import build_extractor_agent, build_research_loop
+from .agents import CONFIDENCE_THRESHOLD, build_extractor_agent, build_research_loop
 from .data import memory
 from .data.precleared import lookup as precleared_lookup
 from .data.scenes import SCENES
+
+# Bounds worst-case entity count per scene: an adversarial or pathological
+# script (e.g. a wall of brand names) could otherwise make the Extractor
+# fan out into dozens of paid Parallel/Vertex calls from one request.
+MAX_ENTITIES_PER_SCENE = 8
 
 # Holds references to fire-and-forget memory.record_decision() tasks so they
 # can't be garbage-collected before completing (a well-known asyncio gotcha
@@ -119,7 +124,8 @@ async def _extract_entities(scene_text: str) -> list[dict]:
         trigger_text="Extract the clearance-relevant entities from this scene.",
     )
     extracted = state.get("extracted_entities") or {}
-    return extracted.get("entities", [])
+    entities = extracted.get("entities", [])
+    return entities[:MAX_ENTITIES_PER_SCENE]
 
 
 async def _clear_entity(
@@ -136,6 +142,7 @@ async def _clear_entity(
             "name": entity_name,
             "category": entity_category,
             "risk": "green",
+            "resolved": True,
             "attempts": [],
             "search_trail": [],
             "reasoning": precleared["note"],
@@ -144,13 +151,14 @@ async def _clear_entity(
         }
 
     if not force_fresh:
-        remembered = await memory.lookup_memory(entity_name)
+        remembered = await memory.lookup_memory(entity_name, entity_category)
         if remembered:
             _log(f"  {entity_name}: found fresh agent-memory record, skipping live research")
             return {
                 "name": entity_name,
                 "category": entity_category,
                 "risk": remembered["risk"],
+                "resolved": True,
                 "attempts": remembered["attempts"],
                 "search_trail": remembered["search_trail"],
                 "reasoning": remembered["reasoning"],
@@ -159,36 +167,64 @@ async def _clear_entity(
             }
 
     _log(f"  {entity_name}: starting research loop")
-    state, events = await _run_agent(
-        build_research_loop(),
-        state={
-            "entity_name": entity_name,
-            "entity_category": entity_category,
-            "scene_text": scene_text,
-            "retry_query": "",
+    try:
+        state, events = await _run_agent(
+            build_research_loop(),
+            state={
+                "entity_name": entity_name,
+                "entity_category": entity_category,
+                "scene_text": scene_text,
+                "retry_query": "",
+                "attempts": [],
+            },
+            trigger_text="Begin the research and evaluation loop for this entity.",
+        )
+    except Exception as exc:  # noqa: BLE001 -- one entity's failure shouldn't 500 the whole request
+        _log(f"  {entity_name}: research loop failed ({exc}), reporting as unresolved")
+        return {
+            "name": entity_name,
+            "category": entity_category,
+            "risk": "red",
+            "resolved": False,
             "attempts": [],
-        },
-        trigger_text="Begin the research and evaluation loop for this entity.",
-    )
+            "search_trail": [],
+            "reasoning": f"Research failed and needs manual review: {exc}",
+            "source": "error",
+        }
     _log(f"  {entity_name}: research loop done ({len(state.get('attempts', []))} round(s))")
 
     attempts = state.get("attempts", [])
     latest = attempts[-1] if attempts else {
         "risk_level": "red",
+        "confidence": 0.0,
         "reasoning": "No verdict was recorded -- treat as unresolved and escalate manually.",
     }
+    # The loop can stop either because the Critic was satisfied (confidence
+    # met CONFIDENCE_THRESHOLD) or because it simply ran out of the 2-round
+    # cap while still unsure. Those aren't the same thing: an exhausted,
+    # still-low-confidence guess must not be presented -- or cached -- as a
+    # settled verdict.
+    resolved = latest.get("confidence", 0.0) >= CONFIDENCE_THRESHOLD
     result = {
         "name": entity_name,
         "category": entity_category,
         "risk": latest["risk_level"],
+        "resolved": resolved,
         "attempts": attempts,
         "search_trail": _extract_search_trail(events),
-        "reasoning": latest["reasoning"],
+        "reasoning": latest["reasoning"]
+        if resolved
+        else (
+            f"{latest['reasoning']} (Research exhausted its retry budget "
+            "without reaching confidence -- treat this as unresolved and "
+            "needing manual review, not a settled clearance.)"
+        ),
         "source": "parallel-mcp",
     }
-    task = asyncio.create_task(memory.record_decision(result))
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    if resolved:
+        task = asyncio.create_task(memory.record_decision(result))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
     return result
 
 
@@ -197,7 +233,20 @@ async def run_pipeline(scenes: list[dict] | None = None, *, force_fresh: bool = 
     graph = {"scenes": []}
     for scene in scenes:
         _log(f"Scene {scene['id']}: extracting entities")
-        entities = await _extract_entities(scene["text"])
+        try:
+            entities = await _extract_entities(scene["text"])
+        except Exception as exc:  # noqa: BLE001 -- one scene's extractor failure shouldn't sink the whole run
+            _log(f"Scene {scene['id']}: entity extraction failed ({exc}), skipping scene")
+            graph["scenes"].append(
+                {
+                    "id": scene["id"],
+                    "heading": scene["heading"],
+                    "text": scene["text"],
+                    "entities": [],
+                    "error": f"Entity extraction failed for this scene: {exc}",
+                }
+            )
+            continue
         _log(f"Scene {scene['id']}: found {[e['name'] for e in entities]}")
         entity_results = await asyncio.gather(
             *[

@@ -31,6 +31,29 @@ def _normalize(entity_name: str) -> str:
     return entity_name.strip().lower().strip("\"'")
 
 
+def _cache_key(entity_name: str, category: str) -> str:
+    # Category is part of the key so two different real-world things that
+    # happen to share a name (e.g. "Elvis" the person vs. a documentary
+    # titled "Elvis") never collide on the same cached verdict.
+    return f"{_normalize(entity_name)}::{category}"
+
+
+def _parse_evidence_date(value: str) -> datetime | None:
+    """Best-effort parse of the Critic's self-reported evidence_as_of
+    string ("YYYY-MM-DD" or "YYYY-MM"). Returns None if empty/unparseable
+    -- callers fall back to resolved_at, which is always a safe (i.e. never
+    understates staleness) bound."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y-%m"):
+        try:
+            return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
 async def _get_client():
     global _client, _client_init_attempted
     if _client is not None:
@@ -60,19 +83,19 @@ async def _get_client():
     return _client
 
 
-async def lookup_memory(entity_name: str) -> dict | None:
+async def lookup_memory(entity_name: str, category: str) -> dict | None:
     """Returns the most recent still-fresh decision for this entity, or
     None if there isn't one / memory is unavailable / it's gone stale.
     """
     client = await _get_client()
     if client is None:
         return None
-    key = _normalize(entity_name)
+    key = _cache_key(entity_name, category)
     try:
         result = await client.query(
             """
             SELECT entity_name, category, risk, reasoning, confidence,
-                   attempts_json, search_trail_json, resolved_at
+                   attempts_json, search_trail_json, resolved_at, evidence_as_of
             FROM clearance_decisions
             WHERE entity_key = {key:String}
             ORDER BY resolved_at DESC
@@ -97,12 +120,22 @@ async def lookup_memory(entity_name: str) -> dict | None:
         attempts_json,
         search_trail_json,
         resolved_at,
+        evidence_as_of,
     ) = row
 
     resolved_at_utc = resolved_at if resolved_at.tzinfo else resolved_at.replace(tzinfo=timezone.utc)
-    age = datetime.now(timezone.utc) - resolved_at_utc
+    # Freshness is measured from the evidence's own confirmed date when the
+    # Critic reported one, not from when the research happened to run --
+    # otherwise evidence that was already close to the Critic's own 18-month
+    # recency bar at research time could be reused for another 18 months on
+    # top of that, effectively tripling the real staleness of what's shown.
+    # Falling back to resolved_at when no evidence date was reported is the
+    # safe direction (it can only make the record look fresher than a
+    # confirmed date would, never staler).
+    baseline = _parse_evidence_date(evidence_as_of) or resolved_at_utc
+    age = datetime.now(timezone.utc) - baseline
     if age > timedelta(days=MEMORY_FRESHNESS_DAYS):
-        _log(f"memory: {entity_name!r} found but stale ({age.days}d old), falling through to live research")
+        _log(f"memory: {entity_name!r} found but stale ({age.days}d since evidence), falling through to live research")
         return None
 
     return {
@@ -130,7 +163,7 @@ async def record_decision(entity: dict) -> None:
             "clearance_decisions",
             [
                 [
-                    _normalize(entity["name"]),
+                    _cache_key(entity["name"], entity["category"]),
                     entity["name"],
                     entity["category"],
                     entity["risk"],
@@ -140,6 +173,7 @@ async def record_decision(entity: dict) -> None:
                     json.dumps(entity.get("search_trail") or []),
                     datetime.now(timezone.utc),
                     entity.get("scene_excerpt", ""),
+                    attempts[-1].get("evidence_as_of", "") if attempts else "",
                 ]
             ],
             column_names=[
@@ -153,6 +187,7 @@ async def record_decision(entity: dict) -> None:
                 "search_trail_json",
                 "resolved_at",
                 "scene_excerpt",
+                "evidence_as_of",
             ],
         )
     except Exception as exc:  # noqa: BLE001

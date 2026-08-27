@@ -1,7 +1,5 @@
 import { MAX_SCRIPT_CHARS } from './demoScript'
 
-const PIPELINE_STEPS = ['Extract', 'Research', 'Evaluate', 'Iterate']
-
 interface ScriptInputProps {
   value: string
   onChange: (v: string) => void
@@ -32,14 +30,6 @@ export function ScriptInput({
         into scenes automatically — no sluglines, and the whole thing runs as
         one scene.
       </p>
-      <ol className="pipeline-steps mono">
-        {PIPELINE_STEPS.map((step, i) => (
-          <li key={step}>
-            <span className="step-index">{String(i + 1).padStart(2, '0')}</span>
-            {step}
-          </li>
-        ))}
-      </ol>
       <textarea
         className="script-textarea"
         value={ready ? value : 'Loading demo script…'}

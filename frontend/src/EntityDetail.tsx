@@ -35,6 +35,24 @@ export function EntityDetail({ entity }: { entity: EntityResult }) {
 
       <p className="entity-detail-reasoning">{entity.reasoning}</p>
 
+      {!entity.resolved && entity.source !== 'error' && (
+        <div className="scope-box">
+          <span className="eyebrow">Needs manual review</span>
+          <p>
+            The research loop exhausted its retry budget without reaching
+            confidence. The risk shown above is a best-effort guess, not a
+            settled clearance -- a human should verify this one directly.
+          </p>
+        </div>
+      )}
+
+      {entity.source === 'error' && (
+        <div className="scope-box">
+          <span className="eyebrow">Research failed</span>
+          <p>This entity couldn&rsquo;t be researched and needs manual review.</p>
+        </div>
+      )}
+
       {entity.source === 'internal-release-repository' ? (
         <div className="scope-box">
           <span className="eyebrow">Internal check</span>

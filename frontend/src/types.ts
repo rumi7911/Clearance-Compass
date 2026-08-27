@@ -13,6 +13,7 @@ export interface Attempt {
   risk_level: RiskLevel
   reasoning: string
   retry_query: string
+  evidence_as_of: string
   research_notes: string
 }
 
@@ -25,10 +26,11 @@ export interface EntityResult {
   name: string
   category: EntityCategory
   risk: RiskLevel
+  resolved: boolean
   attempts: Attempt[]
   search_trail: SearchTrailItem[]
   reasoning: string
-  source: 'internal-release-repository' | 'parallel-mcp' | 'agent-memory'
+  source: 'internal-release-repository' | 'parallel-mcp' | 'agent-memory' | 'error'
   license_ref?: string
   resolved_at?: string
 }
@@ -38,6 +40,7 @@ export interface SceneResult {
   heading: string
   text: string
   entities: EntityResult[]
+  error?: string
 }
 
 export interface ClearanceGraphData {
